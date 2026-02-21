@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import re
 from dataclasses import dataclass
 from datetime import datetime, date
@@ -11,7 +12,6 @@ import requests
 from bs4 import BeautifulSoup
 
 # ---- Config ----
-TZ_JST = "Asia/Tokyo"  # 表示用。GitHub ActionsはUTCだが日付は取得元の基準日を使う。
 DATA_PATH = Path("data/nav.csv")
 
 MUFG_BASE = "https://developer.am.mufg.jp"
@@ -20,7 +20,7 @@ MUFG_LATEST_BY_FUNDCD = f"{MUFG_BASE}/fund_information_latest/fund_cd/{{fund_cd}
 
 PICTET_ITRUST_URL = "https://www.pictet.co.jp/fund/iindia.html"
 
-USER_AGENT = "nav-bot/1.0 (+https://github.com/)"
+USER_AGENT = "nav-bot/1.1 (+https://github.com/)"
 
 # 対象銘柄（MUFGは code_list の fund_name で解決）
 MUFG_TARGETS = [
@@ -43,32 +43,112 @@ def normalize(s: str) -> str:
 
 
 def http_get(url: str) -> requests.Response:
-    return requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=30)
+    return requests.get(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json,text/plain,*/*",
+        },
+        timeout=30,
+    )
 
 
-def pick_value_array(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+# -----------------------------
+# MUFG response parsing (robust)
+# -----------------------------
+
+def looks_like_code_list_item(x: Any) -> bool:
+    """code_list の1行っぽい dict か判定"""
+    if not isinstance(x, dict):
+        return False
+    keys = set(x.keys())
+    # fund_cd / fund_name があるのが一番ありがたいが、揺れも考慮
+    has_cd = any(k in keys for k in ("fund_cd", "fundcd", "fundCode"))
+    has_nm = any(k in keys for k in ("fund_name", "fund_nm", "fundName"))
+    return has_cd and has_nm
+
+
+def find_list_of_dicts(payload: Any) -> List[Dict[str, Any]]:
     """
-    MUFG APIのレスポンスは {details:{value:[...]}} などの形が多い。
-    揺れがあっても拾えるようにする。
+    JSON内を再帰探索して、code_list本体っぽい「dictの配列」を拾う。
+    - まず「dictの配列」で、その要素が fund_cd & fund_name を持つものを優先。
+    - 見つからなければ空。
     """
-    v = None
-    if isinstance(payload.get("details"), dict):
-        v = payload["details"].get("value")
-    if v is None and isinstance(payload.get("detaets"), dict):  # 実装例で揺れが見られるケース対策
-        v = payload["detaets"].get("value")
-    if v is None:
-        v = payload.get("value")
-    return v if isinstance(v, list) else []
+    candidates: List[List[Dict[str, Any]]] = []
+
+    def rec(node: Any) -> None:
+        if isinstance(node, list):
+            if node and all(isinstance(e, dict) for e in node):
+                # code_listっぽいか？
+                if any(looks_like_code_list_item(e) for e in node[: min(50, len(node))]):
+                    candidates.append(node)  # 優先候補
+            for e in node:
+                rec(e)
+        elif isinstance(node, dict):
+            for v in node.values():
+                rec(v)
+
+    rec(payload)
+
+    # 候補が複数ある場合、先頭50件中の「それっぽさ」が高い配列を選ぶ
+    def score(lst: List[Dict[str, Any]]) -> int:
+        sample = lst[: min(50, len(lst))]
+        return sum(1 for e in sample if looks_like_code_list_item(e))
+
+    if not candidates:
+        return []
+
+    candidates.sort(key=score, reverse=True)
+    return candidates[0]
+
+
+def extract_value_array(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    古い実装で想定していた場所も一応チェックしつつ、
+    ダメなら再帰探索にフォールバック。
+    """
+    # よくあるパターン
+    for path in (
+        ("details", "value"),
+        ("detaets", "value"),
+        ("data", "value"),
+        ("value",),
+    ):
+        cur: Any = payload
+        ok = True
+        for p in path:
+            if isinstance(cur, dict) and p in cur:
+                cur = cur[p]
+            else:
+                ok = False
+                break
+        if ok and isinstance(cur, list) and cur and all(isinstance(e, dict) for e in cur):
+            return cur
+
+    # フォールバック：中身を探索して見つける
+    return find_list_of_dicts(payload)
 
 
 def fetch_mufg_code_list() -> List[Dict[str, Any]]:
     r = http_get(MUFG_CODE_LIST)
     if r.status_code != 200:
-        raise RuntimeError(f"MUFG code_list HTTP {r.status_code}: {r.text[:500]}")
-    data = r.json()
-    items = pick_value_array(data)
+        raise RuntimeError(f"MUFG code_list HTTP {r.status_code}: {r.text[:800]}")
+
+    try:
+        data = r.json()
+    except Exception:
+        raise RuntimeError(f"MUFG code_list: JSONとしてパースできませんでした: {r.text[:800]}")
+
+    items = extract_value_array(data)
     if not items:
-        raise RuntimeError("MUFG code_list: value配列が空でした（仕様変更の可能性）")
+        # ここで情報を出して落ちる（次に直しやすくする）
+        top_keys = list(data.keys()) if isinstance(data, dict) else type(data).__name__
+        snippet = json.dumps(data, ensure_ascii=False)[:1200]
+        raise RuntimeError(
+            "MUFG code_list: code_list本体の配列を見つけられませんでした（仕様変更の可能性）\n"
+            f"top_keys={top_keys}\n"
+            f"json_snippet={snippet}"
+        )
     return items
 
 
@@ -78,7 +158,7 @@ def score_name(name: str, keywords: List[str]) -> float:
     for kw in keywords:
         if normalize(kw) in n:
             score += 1.0
-    # 「emaxis」「slim」を含むなら少し加点（誤爆を減らす）
+    # 誤爆を減らす軽い加点
     if "emaxis" in n:
         score += 0.25
     if "slim" in n:
@@ -90,7 +170,7 @@ def resolve_fund_cd(items: List[Dict[str, Any]], keywords: List[str]) -> str:
     best = None
     best_score = -1.0
     for it in items:
-        name = it.get("fund_name") or it.get("fund_nm") or ""
+        name = it.get("fund_name") or it.get("fund_nm") or it.get("fundName") or ""
         if not isinstance(name, str) or not name:
             continue
         sc = score_name(name, keywords)
@@ -98,9 +178,18 @@ def resolve_fund_cd(items: List[Dict[str, Any]], keywords: List[str]) -> str:
             best_score = sc
             best = it
 
-    # 最低2ヒットくらいないと危険なのでガード
     if best is None or best_score < 2.0:
-        raise RuntimeError(f"MUFG: fund_cd解決に失敗（best_score={best_score}, keywords={keywords}）")
+        # 失敗時に候補を少し見える化
+        preview = []
+        for it in items[:50]:
+            nm = it.get("fund_name") or it.get("fund_nm") or it.get("fundName")
+            cd = it.get("fund_cd") or it.get("fundcd") or it.get("fundCode")
+            if nm and cd:
+                preview.append(f"{cd}:{nm}")
+        raise RuntimeError(
+            f"MUFG: fund_cd解決に失敗（best_score={best_score}, keywords={keywords}）\n"
+            f"preview(先頭候補50)={preview[:20]}"
+        )
 
     fund_cd = best.get("fund_cd") or best.get("fundcd") or best.get("fundCode")
     if not fund_cd:
@@ -112,11 +201,13 @@ def fetch_mufg_latest_by_fundcd(fund_cd: str) -> NavPoint:
     url = MUFG_LATEST_BY_FUNDCD.format(fund_cd=fund_cd)
     r = http_get(url)
     if r.status_code != 200:
-        raise RuntimeError(f"MUFG latest HTTP {r.status_code}: {r.text[:500]}")
+        raise RuntimeError(f"MUFG latest HTTP {r.status_code}: {r.text[:800]}")
+
     data = r.json()
-    arr = pick_value_array(data)
+    arr = extract_value_array(data)
     if not arr:
         raise RuntimeError(f"MUFG latest: データが空です fund_cd={fund_cd}")
+
     item = arr[0]
     base_date = item.get("base_date") or item.get("baseDate")
     nav = item.get("nav")
@@ -124,6 +215,10 @@ def fetch_mufg_latest_by_fundcd(fund_cd: str) -> NavPoint:
         raise RuntimeError(f"MUFG latest: base_date/nav が取れません fund_cd={fund_cd}")
     return NavPoint(base_date=str(base_date), nav=int(float(nav)))
 
+
+# -----------------------------
+# Pictet iTrust India
+# -----------------------------
 
 def fetch_pictet_itrust_india() -> NavPoint:
     r = http_get(PICTET_ITRUST_URL)
@@ -133,9 +228,7 @@ def fetch_pictet_itrust_india() -> NavPoint:
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text("\n")
 
-    # 例: 基準日: 2026年02月17日
     m_date = re.search(r"基準日[:：]\s*([0-9]{4})年\s*([0-9]{1,2})月\s*([0-9]{1,2})日", text)
-    # 例: 基準価額 23,303円
     m_nav = re.search(r"基準価額\s*([0-9]{1,3}(?:,[0-9]{3})*)\s*円", text)
 
     if not m_date or not m_nav:
@@ -146,6 +239,10 @@ def fetch_pictet_itrust_india() -> NavPoint:
     nav = int(m_nav.group(1).replace(",", ""))
     return NavPoint(base_date=base_date, nav=nav)
 
+
+# -----------------------------
+# CSV helpers
+# -----------------------------
 
 def ensure_csv_header(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -197,8 +294,6 @@ def sort_csv_by_date(path: Path) -> None:
 
 def main() -> None:
     ensure_csv_header(DATA_PATH)
-
-    # 既存日付を読み込み（重複防止）
     existing_dates = read_existing_dates(DATA_PATH)
 
     # ---- MUFG 2本 ----
@@ -211,7 +306,7 @@ def main() -> None:
     # ---- Pictet iTrust ----
     itrust = fetch_pictet_itrust_india()
 
-    # 日付は「基準日」が揃わない可能性があるので、まずは iTrust の基準日を採用
+    # 日付はまず iTrust の基準日（揃わない場合があるため）
     base_date = itrust.base_date
 
     if base_date in existing_dates:
